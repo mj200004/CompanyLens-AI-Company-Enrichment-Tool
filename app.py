@@ -1,9 +1,10 @@
 """
-app.py  —  CompanyLens Flask Backend
+app.py  —  CompanyLens Flask Backend (Gemini Edition)
 Routes:
   POST  /enrich         → scrape + AI enrich one URL
   GET   /results        → return all saved results
   POST  /results/clear  → wipe all results
+  GET   /health         → health check
 """
 
 import os
@@ -17,14 +18,11 @@ from flask_cors import CORS
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from difflib import SequenceMatcher
-import anthropic
 
-# ─────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder="static", static_url_path="")
-CORS(app)  # Allow all origins — required for browser ↔ backend to work
-# ─────────────────────────────────────────────────────────────────────────────
+CORS(app)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RESULTS_FILE = "results.json"
 
 TARGET_KEYWORDS = ["about", "contact", "services", "team", "company",
@@ -46,10 +44,10 @@ STRICT RULES:
 1. Only use information CLEARLY stated in the provided text.
 2. NEVER invent, guess, or hallucinate contact details, addresses, or services.
 3. If a field cannot be found, return "" for strings or [] for arrays.
-4. Return ONLY a valid JSON object — no markdown, no explanation."""
+4. Return ONLY a valid JSON object — no markdown fences, no explanation."""
 
 
-# ─────────────────────────────────────────── Persistence ─────────────────────
+# ─────────────────────────────────────── Persistence ─────────────────────────
 
 def load_results():
     if os.path.exists(RESULTS_FILE):
@@ -66,7 +64,7 @@ def save_results(data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-# ─────────────────────────────────────────── Scraping ────────────────────────
+# ─────────────────────────────────────── Scraping ────────────────────────────
 
 def fetch_page(url, timeout=12):
     try:
@@ -140,6 +138,8 @@ def clean_html(html):
     for tag in soup(REMOVE_TAGS):
         tag.decompose()
     for tag in soup.find_all(True):
+        if not hasattr(tag, "attrs") or tag.attrs is None:
+            continue
         cls = " ".join(tag.get("class", []))
         if any(n in cls.lower() for n in NOISE_CLASSES):
             tag.decompose()
@@ -158,7 +158,6 @@ def scrape_company(base_url):
         html = fetch_page(url)
         if not html:
             continue
-        # Regex-extract emails and phones from raw HTML (more reliable than AI for this)
         emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", html)
         phones = re.findall(r"[\+]?[\d][\d\s\-\.\(\)]{7,}[\d]", html)
         all_emails.update(emails)
@@ -170,7 +169,28 @@ def scrape_company(base_url):
     return "\n\n".join(parts), list(all_emails), list(all_phones)
 
 
-# ─────────────────────────────────────────── AI Enrichment ───────────────────
+# ─────────────────────────────────────── Gemini AI ───────────────────────────
+
+def call_gemini(prompt):
+    """Call Gemini 1.5 Flash — free tier, no billing needed."""
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+    body = {
+        "contents": [{
+            "parts": [{"text": SYSTEM_PROMPT + "\n\n" + prompt}]
+        }],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 1000,
+        }
+    }
+    resp = requests.post(url, json=body, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
 
 def empty_record(url, website_name_override=""):
     return {
@@ -193,7 +213,7 @@ def enrich_with_ai(url, text, emails, phones, website_name_override=""):
 
     contact_hint = ""
     if emails:
-        contact_hint += f"\nEmails found on site (use these): {list(set(emails))[:6]}"
+        contact_hint += f"\nEmails found on site: {list(set(emails))[:6]}"
     if phones:
         contact_hint += f"\nPhones found on site: {list(set(phones))[:3]}"
 
@@ -208,30 +228,21 @@ Return ONLY a JSON object with these exact keys:
 - mail: array of email addresses if present, else []
 - core_service: 1-2 sentence summary of their main product/service
 - target_customer: who they serve (industry, size, geography)
-- probable_pain_point: key business problem their customers likely face
+- probable_pain_point: key business problem their customers face
 - outreach_opener: personalized 1-2 sentence cold outreach referencing their actual work
 
 Scraped website text:
 {text[:5500]}"""
 
-    api_key = ANTHROPIC_API_KEY
-    if not api_key:
-        return {**empty_record(url, website_name_override), "core_service": "API key not configured"}
+    if not GEMINI_API_KEY:
+        return {**empty_record(url, website_name_override),
+                "core_service": "API key not configured — set GEMINI_API_KEY"}
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=900,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw = msg.content[0].text.strip()
-        # Strip markdown fences if model adds them
+        raw = call_gemini(prompt)
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
         raw = re.sub(r"\n?```$", "", raw).strip()
         result = json.loads(raw)
-        # Normalize mail field
         if isinstance(result.get("mail"), str):
             result["mail"] = [result["mail"]] if result["mail"] else []
         if website_name_override:
@@ -246,7 +257,7 @@ Scraped website text:
         return {**empty_record(url, website_name_override), "core_service": f"Error: {str(e)}"}
 
 
-# ─────────────────────────────────────────── Flask Routes ────────────────────
+# ─────────────────────────────────────── Flask Routes ────────────────────────
 
 @app.route("/")
 def index():
@@ -267,7 +278,6 @@ def enrich():
     text, emails, phones = scrape_company(url)
     record = enrich_with_ai(url, text, emails, phones, website_name)
 
-    # Persist — update if URL already exists
     all_results = load_results()
     idx = next((i for i, r in enumerate(all_results) if r.get("_url") == url), None)
     if idx is not None:
@@ -292,10 +302,8 @@ def clear_results():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "key_set": bool(ANTHROPIC_API_KEY)})
+    return jsonify({"status": "ok", "key_set": bool(GEMINI_API_KEY)})
 
-
-# ─────────────────────────────────────────── Run ─────────────────────────────
 
 if __name__ == "__main__":
     print("Starting CompanyLens server on http://0.0.0.0:5000")
