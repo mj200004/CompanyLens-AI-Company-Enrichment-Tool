@@ -74,3 +74,8 @@ curl -X POST https://your-app.onrender.com/enrich \
   -H "Content-Type: application/json" \
   -d '{"url": "https://www.infosys.com"}'
 ```
+
+live demo
+```
+https://companylens-ai-company-enrichment-tool.onrender.com/
+```
