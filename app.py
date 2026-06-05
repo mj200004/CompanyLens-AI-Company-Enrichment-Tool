@@ -19,12 +19,14 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from difflib import SequenceMatcher
 
+# Import the modern official Google GenAI Library
+from google import genai
+from google.genai import types
+
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RESULTS_FILE = "results.json"
-
 TARGET_KEYWORDS = ["about", "contact", "services", "team", "company",
                    "solution", "product", "who-we-are", "careers"]
 
@@ -46,6 +48,13 @@ STRICT RULES:
 3. If a field cannot be found, return "" for strings or [] for arrays.
 4. Return ONLY a valid JSON object — no markdown fences, no explanation."""
 
+# Initialize the Gemini Client. It will look for the 'GEMINI_API_KEY' env variable.
+# If it sees an Anthropic key (sk-ant-), we handle it gracefully inside our enrich function.
+try:
+    client = genai.Client()
+except Exception as e:
+    print(f"Warning initializing Gemini Client: {e}")
+    client = None
 
 # ─────────────────────────────────────── Persistence ─────────────────────────
 
@@ -171,27 +180,6 @@ def scrape_company(base_url):
 
 # ─────────────────────────────────────── Gemini AI ───────────────────────────
 
-def call_gemini(prompt):
-    """Call Gemini 1.5 Flash — free tier, no billing needed."""
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    )
-    body = {
-        "contents": [{
-            "parts": [{"text": SYSTEM_PROMPT + "\n\n" + prompt}]
-        }],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 1000,
-        }
-    }
-    resp = requests.post(url, json=body, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-
 def empty_record(url, website_name_override=""):
     return {
         "website_name": website_name_override or urlparse(url).netloc,
@@ -210,6 +198,16 @@ def empty_record(url, website_name_override=""):
 def enrich_with_ai(url, text, emails, phones, website_name_override=""):
     if not text.strip():
         return empty_record(url, website_name_override)
+
+    # Simple validation step to check if the user mistakenly put a Claude key
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if api_key.startswith("sk-ant-"):
+        return {**empty_record(url, website_name_override),
+                "core_service": "Configuration Error: The GEMINI_API_KEY starts with 'sk-ant-', which is an Anthropic Claude key. Please swap it out for a Google AI Studio key on your Render Dashboard."}
+
+    if not api_key:
+        return {**empty_record(url, website_name_override),
+                "core_service": "API key not configured — please set GEMINI_API_KEY"}
 
     contact_hint = ""
     if emails:
@@ -234,21 +232,30 @@ Return ONLY a JSON object with these exact keys:
 Scraped website text:
 {text[:5500]}"""
 
-    if not GEMINI_API_KEY:
-        return {**empty_record(url, website_name_override),
-                "core_service": "API key not configured — set GEMINI_API_KEY"}
-
     try:
-        raw = call_gemini(prompt)
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw).strip()
-        result = json.loads(raw)
+        # Utilize the modern SDK client for gemini-2.5-flash
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.1,
+                max_output_tokens=1000,
+                # Forces Gemini to natively output pure JSON strings without markdown triple backticks
+                response_mime_type="application/json"
+            ),
+        )
+        
+        # Load the structured text string directly into a python dict
+        result = json.loads(response.text.strip())
+        
         if isinstance(result.get("mail"), str):
             result["mail"] = [result["mail"]] if result["mail"] else []
         if website_name_override:
             result["website_name"] = website_name_override
         result["_url"] = url
         return result
+        
     except json.JSONDecodeError as e:
         print(f"JSON parse error for {url}: {e}")
         return empty_record(url, website_name_override)
@@ -302,7 +309,8 @@ def clear_results():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "key_set": bool(GEMINI_API_KEY)})
+    has_key = bool(os.environ.get("GEMINI_API_KEY", ""))
+    return jsonify({"status": "ok", "key_set": has_key})
 
 
 if __name__ == "__main__":
