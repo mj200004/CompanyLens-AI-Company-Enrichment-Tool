@@ -1,9 +1,29 @@
 services:
   - type: web
-    name: company-enricher
+    name: companylens
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+    plan: free
+    buildCommand: pip install -r requirements.txt -r requirements-dev.txt
+    startCommand: gunicorn run:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 180
+    healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: APP_ENV
+        value: production
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
       - key: ANTHROPIC_API_KEY
         sync: false
+      - key: REQUEST_TIMEOUT
+        value: "12"
+      - key: MAX_FETCH_PAGES
+        value: "5"
+      - key: MAX_PAGE_BYTES
+        value: "2000000"
+      - key: SCRAPER_WORKERS
+        value: "4"
+      - key: LOG_LEVEL
+        value: INFO
